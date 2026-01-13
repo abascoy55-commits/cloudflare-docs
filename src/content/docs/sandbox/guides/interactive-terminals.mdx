@@ -1,0 +1,541 @@
+---
+title: Interactive Terminals
+pcx_content_type: how-to
+sidebar:
+  order: 7
+---
+
+import { TypeScriptExample, PackageManagers } from "~/components";
+
+Build applications that provide interactive terminal experiences using PTY (pseudo-terminal) sessions. PTY support enables real terminal emulation with full cursor control, colors, and interactive applications.
+
+## Overview
+
+PTY sessions bridge the gap between simple command execution and full terminal interaction. Unlike `sandbox.exec()`, PTY sessions provide:
+
+- **Persistent Shell State**: Working directory and environment persist across commands
+- **Interactive Applications**: Support for text editors, REPLs, and TUI applications  
+- **Real-time I/O**: Immediate input/output without waiting for command completion
+- **Terminal Features**: Colors, cursor positioning, and escape sequences
+
+## Basic Terminal Session
+
+Create a simple terminal interface that users can interact with:
+
+<TypeScriptExample>
+```ts
+// Create PTY with standard dimensions
+const pty = await sandbox.pty.create({
+  cols: 80,
+  rows: 24,
+  command: ['/bin/bash']
+});
+
+// Set up output handling
+pty.onData((data) => {
+  // Send to your terminal UI (xterm.js, etc.)
+  terminalElement.write(data);
+});
+
+// Handle user input
+terminalElement.onInput((input) => {
+  // Send to PTY
+  pty.write(input);
+});
+
+// Handle process exit
+pty.onExit(({ exitCode }) => {
+  console.log(`Shell exited with code ${exitCode}`);
+});
+```
+</TypeScriptExample>
+
+## Web-Based Terminal
+
+Integrate with xterm.js for a full browser-based terminal:
+
+### Frontend Setup
+
+<PackageManagers 
+  type="install" 
+  pkg="@xterm/xterm @xterm/addon-fit @xterm/addon-web-links" 
+/>
+
+<TypeScriptExample>
+```ts
+import { Terminal } from '@xterm/xterm';
+import { FitAddon } from '@xterm/addon-fit';
+import '@xterm/xterm/css/xterm.css';
+
+// Create terminal instance
+const term = new Terminal({
+  cursorBlink: true,
+  fontSize: 14,
+  fontFamily: 'Monaco, Menlo, "Ubuntu Mono", monospace'
+});
+
+const fitAddon = new FitAddon();
+term.loadAddon(fitAddon);
+
+// Mount to DOM
+term.open(document.getElementById('terminal'));
+fitAddon.fit();
+
+// Connect to sandbox PTY
+const pty = await sandbox.pty.create({
+  cols: term.cols,
+  rows: term.rows
+});
+
+// Bidirectional data flow
+pty.onData((data) => term.write(data));
+term.onData((data) => pty.write(data));
+
+// Handle resize
+const observer = new ResizeObserver(() => {
+  fitAddon.fit();
+  pty.resize(term.cols, term.rows);
+});
+observer.observe(document.getElementById('terminal'));
+```
+</TypeScriptExample>
+
+### Backend Worker
+
+<TypeScriptExample>
+```ts
+export default {
+  async fetch(request: Request, env: Env): Promise<Response> {
+    const sandbox = getSandbox(env.Sandbox, 'terminal-session');
+    
+    if (request.url.endsWith('/pty')) {
+      // Create new PTY session
+      const pty = await sandbox.pty.create({
+        cols: 80,
+        rows: 24,
+        cwd: '/workspace'
+      });
+      
+      return Response.json({ id: pty.id });
+    }
+    
+    // Handle other routes...
+  }
+};
+```
+</TypeScriptExample>
+
+## Multi-User Collaborative Terminal
+
+Build a collaborative terminal where multiple users share the same session:
+
+<TypeScriptExample>
+```ts
+interface TerminalRoom {
+  ptyId: string;
+  users: Set<WebSocket>;
+  history: string[];
+}
+
+const rooms = new Map<string, TerminalRoom>();
+
+export default {
+  async fetch(request: Request, env: Env): Promise<Response> {
+    if (request.headers.get('upgrade') === 'websocket') {
+      return handleWebSocket(request, env);
+    }
+    
+    // Create new room
+    if (request.method === 'POST') {
+      const sandbox = getSandbox(env.Sandbox, 'collaborative-terminal');
+      const pty = await sandbox.pty.create({
+        cols: 80,
+        rows: 24
+      });
+      
+      const roomId = crypto.randomUUID();
+      rooms.set(roomId, {
+        ptyId: pty.id,
+        users: new Set(),
+        history: []
+      });
+      
+      // Forward PTY output to all users
+      pty.onData((data) => {
+        const room = rooms.get(roomId);
+        if (room) {
+          room.history.push(data);
+          // Keep last 1000 lines
+          if (room.history.length > 1000) {
+            room.history.shift();
+          }
+          
+          // Broadcast to all connected users
+          for (const ws of room.users) {
+            ws.send(JSON.stringify({ type: 'output', data }));
+          }
+        }
+      });
+      
+      return Response.json({ roomId });
+    }
+  }
+};
+
+async function handleWebSocket(request: Request, env: Env) {
+  const url = new URL(request.url);
+  const roomId = url.searchParams.get('room');
+  
+  const room = rooms.get(roomId);
+  if (!room) {
+    return new Response('Room not found', { status: 404 });
+  }
+  
+  const { 0: client, 1: server } = new WebSocketPair();
+  
+  // Add user to room
+  room.users.add(server);
+  
+  // Send history to new user
+  server.send(JSON.stringify({
+    type: 'history',
+    data: room.history.join('')
+  }));
+  
+  // Handle user input
+  server.addEventListener('message', async (event) => {
+    const message = JSON.parse(event.data);
+    
+    if (message.type === 'input') {
+      // Get PTY and send input
+      const sandbox = getSandbox(env.Sandbox, 'collaborative-terminal');
+      const pty = await sandbox.pty.getById(room.ptyId);
+      await pty.write(message.data);
+    }
+  });
+  
+  // Clean up on disconnect
+  server.addEventListener('close', () => {
+    room.users.delete(server);
+    if (room.users.size === 0) {
+      rooms.delete(roomId);
+    }
+  });
+  
+  return new Response(null, { status: 101, webSocket: client });
+}
+```
+</TypeScriptExample>
+
+## Development Environment
+
+Create an online IDE with integrated terminal:
+
+<TypeScriptExample>
+```ts
+class DevelopmentEnvironment {
+  private sandbox: ISandbox;
+  private pty: Pty | null = null;
+  
+  constructor(sandbox: ISandbox) {
+    this.sandbox = sandbox;
+  }
+  
+  async initialize() {
+    // Set up development environment
+    await this.sandbox.exec('cd /workspace && npm install');
+    
+    // Create persistent terminal session
+    this.pty = await this.sandbox.pty.create({
+      cols: 120,
+      rows: 30,
+      cwd: '/workspace',
+      env: {
+        NODE_ENV: 'development',
+        TERM: 'xterm-256color'
+      }
+    });
+    
+    return this.pty;
+  }
+  
+  async runTests() {
+    if (!this.pty) throw new Error('Environment not initialized');
+    
+    // Run tests in the persistent terminal
+    await this.pty.write('npm test\n');
+  }
+  
+  async startDevServer() {
+    if (!this.pty) throw new Error('Environment not initialized');
+    
+    // Start dev server
+    await this.pty.write('npm run dev\n');
+  }
+  
+  async installPackage(packageName: string) {
+    if (!this.pty) throw new Error('Environment not initialized');
+    
+    await this.pty.write(`npm install ${packageName}\n`);
+    
+    // Wait for installation to complete
+    return new Promise((resolve) => {
+      const handler = (data: string) => {
+        if (data.includes('added') && data.includes('packages')) {
+          this.pty?.removeListener('data', handler);
+          resolve(void 0);
+        }
+      };
+      this.pty?.onData(handler);
+    });
+  }
+}
+
+// Usage
+const env = new DevelopmentEnvironment(sandbox);
+const pty = await env.initialize();
+
+// Connect to frontend terminal
+pty.onData((data) => terminalUI.write(data));
+```
+</TypeScriptExample>
+
+## Interactive Applications
+
+Run interactive applications like text editors or REPLs:
+
+<TypeScriptExample>
+```ts
+// Python REPL
+const pythonRepl = await sandbox.pty.create({
+  command: ['python3', '-i'],
+  cols: 80,
+  rows: 24
+});
+
+// Send Python code
+await pythonRepl.write('import numpy as np\n');
+await pythonRepl.write('data = np.array([1, 2, 3, 4, 5])\n');
+await pythonRepl.write('print(data.mean())\n');
+
+// Nano text editor
+const editor = await sandbox.pty.create({
+  command: ['nano', '/workspace/config.json'],
+  cols: 120,
+  rows: 40
+});
+
+// User can interact with nano through the terminal
+editor.onData((data) => {
+  // Handle nano's output and display to user
+  terminalDisplay.write(data);
+});
+```
+</TypeScriptExample>
+
+## Session Management
+
+Manage multiple terminal sessions within a single sandbox:
+
+<TypeScriptExample>
+```ts
+class TerminalManager {
+  private sessions = new Map<string, Pty>();
+  
+  async createSession(name: string, options?: CreatePtyOptions): Promise<string> {
+    const pty = await this.sandbox.pty.create({
+      cols: 80,
+      rows: 24,
+      ...options
+    });
+    
+    this.sessions.set(name, pty);
+    
+    // Handle cleanup on exit
+    pty.onExit(() => {
+      this.sessions.delete(name);
+    });
+    
+    return pty.id;
+  }
+  
+  async switchToSession(name: string): Promise<Pty | null> {
+    return this.sessions.get(name) || null;
+  }
+  
+  async listSessions(): Promise<string[]> {
+    return Array.from(this.sessions.keys());
+  }
+  
+  async closeSession(name: string): Promise<void> {
+    const pty = this.sessions.get(name);
+    if (pty) {
+      await pty.kill();
+      this.sessions.delete(name);
+    }
+  }
+}
+
+// Usage
+const termManager = new TerminalManager();
+
+// Create multiple sessions
+await termManager.createSession('main', { cwd: '/workspace' });
+await termManager.createSession('logs', { 
+  command: ['tail', '-f', '/var/log/app.log'] 
+});
+await termManager.createSession('db', { 
+  command: ['psql', 'postgres://...'] 
+});
+
+// Switch between sessions in your UI
+const mainTerminal = await termManager.switchToSession('main');
+```
+</TypeScriptExample>
+
+## Terminal Customization
+
+Customize the terminal appearance and behavior:
+
+<TypeScriptExample>
+```ts
+// Custom terminal theme
+const customTheme = {
+  background: '#1a1b26',
+  foreground: '#c0caf5',
+  cursor: '#f7768e',
+  black: '#15161e',
+  red: '#f7768e',
+  green: '#9ece6a',
+  yellow: '#e0af68',
+  blue: '#7aa2f7',
+  magenta: '#bb9af7',
+  cyan: '#7dcfff',
+  white: '#a9b1d6'
+};
+
+const term = new Terminal({
+  theme: customTheme,
+  cursorBlink: true,
+  cursorStyle: 'bar',
+  fontSize: 16,
+  fontFamily: 'JetBrains Mono, Monaco, Consolas, monospace',
+  lineHeight: 1.2
+});
+
+// Create PTY with custom shell prompt
+const pty = await sandbox.pty.create({
+  cols: term.cols,
+  rows: term.rows,
+  env: {
+    PS1: '\\[\\033[01;32m\\]\\u@sandbox:\\[\\033[01;34m\\]\\w\\[\\033[00m\\]$ '
+  }
+});
+```
+</TypeScriptExample>
+
+## Error Handling
+
+Implement robust error handling for terminal sessions:
+
+<TypeScriptExample>
+```ts
+class RobustTerminal {
+  private pty: Pty | null = null;
+  private reconnectAttempts = 0;
+  private maxReconnects = 3;
+  
+  async connect(): Promise<void> {
+    try {
+      this.pty = await sandbox.pty.create({
+        cols: 80,
+        rows: 24
+      });
+      
+      this.pty.onData((data) => {
+        this.handleOutput(data);
+      });
+      
+      this.pty.onExit(({ exitCode }) => {
+        this.handleExit(exitCode);
+      });
+      
+      this.reconnectAttempts = 0;
+      
+    } catch (error) {
+      await this.handleConnectionError(error);
+    }
+  }
+  
+  async handleConnectionError(error: Error): Promise<void> {
+    console.error('PTY connection failed:', error);
+    
+    if (this.reconnectAttempts < this.maxReconnects) {
+      this.reconnectAttempts++;
+      console.log(`Retrying connection (${this.reconnectAttempts}/${this.maxReconnects})`);
+      
+      // Exponential backoff
+      const delay = Math.pow(2, this.reconnectAttempts) * 1000;
+      await new Promise(resolve => setTimeout(resolve, delay));
+      
+      await this.connect();
+    } else {
+      throw new Error('Max reconnection attempts exceeded');
+    }
+  }
+  
+  async safeWrite(data: string): Promise<void> {
+    try {
+      await this.pty?.write(data);
+    } catch (error) {
+      console.error('Write failed:', error);
+      // Attempt reconnection
+      await this.connect();
+      await this.pty?.write(data);
+    }
+  }
+  
+  handleOutput(data: string): void {
+    // Process and display output
+    terminalUI.write(data);
+  }
+  
+  handleExit(exitCode: number): void {
+    if (exitCode === 0) {
+      console.log('Terminal session ended normally');
+    } else {
+      console.error(`Terminal session ended with error code ${exitCode}`);
+      // Optionally restart the session
+      this.connect();
+    }
+  }
+}
+```
+</TypeScriptExample>
+
+## Best Practices
+
+1. **Resource Management**: Clean up PTY sessions when no longer needed to prevent memory leaks
+
+2. **Dimension Validation**: Always validate terminal dimensions are within the valid range (1-1000)
+
+3. **Input Sanitization**: Sanitize user input when constructing commands to prevent injection
+
+4. **Connection Recovery**: Implement reconnection logic for network interruptions
+
+5. **History Management**: Buffer terminal output for new users joining collaborative sessions
+
+6. **Performance**: Use WebSocket transport for real-time applications, HTTP for less interactive use cases
+
+7. **Security**: Validate user permissions before allowing terminal access
+
+8. **Session Persistence**: Use session attachment to maintain environment state across PTY recreations
+
+## Common Use Cases
+
+- **Development Environments**: Online IDEs with integrated terminals
+- **Educational Platforms**: Interactive coding tutorials with live terminals  
+- **DevOps Dashboards**: Real-time log monitoring and server management
+- **Collaborative Debugging**: Shared terminal sessions for team troubleshooting
+- **CI/CD Interfaces**: Live build output and deployment monitoring
+- **System Administration**: Web-based server management interfaces
